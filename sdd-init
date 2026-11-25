@@ -1,0 +1,352 @@
+#!/usr/bin/env bash
+# shellcheck disable=SC2016,SC2034
+# sdd-init — set up GitHub Spec Kit + planner/builder/reviewer/committer agents for a project.
+#
+# Run it inside the project folder you want to set up:
+#   sdd-init                 # interactive
+#   sdd-init --help          # all flags (every question can be answered by a flag)
+#
+# Works with the bash shipped on macOS (3.2) and on Linux.
+
+set -eo pipefail
+
+SDD_INIT_VERSION='1.0.0'
+DEFAULT_SPECKIT_VERSION='v1.4.4'
+
+_self=$0
+while [ -L "$_self" ]; do
+  _link=$(readlink "$_self")
+  case "$_link" in /*) _self=$_link ;; *) _self="$(dirname "$_self")/$_link" ;; esac
+done
+SDD_HOME=$(cd "$(dirname "$_self")" && pwd)
+
+# shellcheck source=lib/ui.sh
+. "$SDD_HOME/lib/ui.sh"
+# shellcheck source=lib/fs.sh
+. "$SDD_HOME/lib/fs.sh"
+# shellcheck source=lib/stacks.sh
+. "$SDD_HOME/lib/stacks.sh"
+# shellcheck source=lib/constitution.sh
+. "$SDD_HOME/lib/constitution.sh"
+# shellcheck source=lib/templates.sh
+. "$SDD_HOME/lib/templates.sh"
+# shellcheck source=lib/agents.sh
+. "$SDD_HOME/lib/agents.sh"
+# shellcheck source=lib/skills.sh
+. "$SDD_HOME/lib/skills.sh"
+# shellcheck source=lib/instructions.sh
+. "$SDD_HOME/lib/instructions.sh"
+
+usage() {
+  cat <<EOF
+sdd-init $SDD_INIT_VERSION — GitHub Spec Kit + agents scaffolder
+
+Usage: sdd-init [options]
+
+Run inside the project folder. Without options it asks every question.
+
+Answers (each skips its question):
+  --name NAME              project name (default: folder name)
+  --tools LIST             claude,codex,gemini,copilot (first = default integration)
+  --kind KIND              backend | frontend
+  --stack ID               backend: go laravel nestjs express fastapi django aspnet other-be
+                           frontend: react nextjs vue nuxt angular sveltekit other-fe
+  --data ID                data access (go: sqlc native both gorm ent none; laravel: eloquent
+                           eloquent-repo; node: prisma typeorm drizzle knex; python: sqlalchemy
+                           sqlmodel django-orm; c#: efcore dapper efcore-dapper; none)
+  --pm PM                  npm | pnpm | yarn | bun        (JS/TS stacks)
+  --py RUNNER              uv | poetry | pip              (Python stacks)
+  --sail y|n               run Laravel commands through Sail
+  --tenant y|n             multi-tenant rules
+  --money y|n              money/payments rules
+  --i18n y|n               multi-language content rules
+  --layout single|multi    one git repo, or a folder of repos
+  --branch NAME            default branch (e.g. main, develop)
+  --protected "A B"        branches agents must never push to
+  --ticket KEY             ticket key prefix (e.g. CR, TICKBKND)
+  --git-ext y|n            install Spec Kit's git extension (auto feature branches)
+
+Behaviour:
+  --speckit-version TAG    Spec Kit tag (default $DEFAULT_SPECKIT_VERSION)
+  --skip-speckit           don't run specify (only generate agents/templates/docs)
+  --reuse                  reuse answers saved in .specify/sdd-init.env
+  --force                  overwrite an existing non-template constitution (backed up)
+  -y, --yes                non-interactive: defaults for every unanswered question
+  --dry-run                show what would be written, change nothing
+  -h, --help               this help
+  --version                print version
+
+Changed files are backed up to .sdd-init-backup/<timestamp>/ before they are overwritten.
+EOF
+}
+
+stack_reset
+TOOLS=''; KIND=''; STACK=''; DATA=''; PM=''; PYRUN=''; TENANT=''; MONEY=''; I18N=''
+LAYOUT=''; DEFAULT_BRANCH=''; PROTECTED_BRANCHES=''; TICKET_KEY=''; GIT_EXT=''; PROJECT_NAME=''
+USE_SAIL_Q=''; SPECKIT_VERSION=''; SKIP_SPECKIT=n; FORCE=n; REUSE=n; NONINTERACTIVE=0; DRY_RUN=0
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --name) PROJECT_NAME=$2; shift ;;
+    --tools) TOOLS=$2; shift ;;
+    --kind) KIND=$2; shift ;;
+    --stack) STACK=$2; shift ;;
+    --data) DATA=$2; shift ;;
+    --pm) PM=$2; shift ;;
+    --py) PYRUN=$2; shift ;;
+    --sail) USE_SAIL_Q=$2; shift ;;
+    --tenant) TENANT=$2; shift ;;
+    --money) MONEY=$2; shift ;;
+    --i18n) I18N=$2; shift ;;
+    --layout) LAYOUT=$2; shift ;;
+    --branch) DEFAULT_BRANCH=$2; shift ;;
+    --protected) PROTECTED_BRANCHES=$2; shift ;;
+    --ticket) TICKET_KEY=$2; shift ;;
+    --git-ext) GIT_EXT=$2; shift ;;
+    --speckit-version) SPECKIT_VERSION=$2; shift ;;
+    --skip-speckit) SKIP_SPECKIT=y ;;
+    --reuse) REUSE=y ;;
+    --force) FORCE=y ;;
+    -y|--yes) NONINTERACTIVE=1 ;;
+    --dry-run) DRY_RUN=1 ;;
+    -h|--help) usage; exit 0 ;;
+    --version) echo "sdd-init $SDD_INIT_VERSION"; exit 0 ;;
+    *) die "Unknown option: $1 (see --help)" ;;
+  esac
+  shift
+done
+
+SAVED_VARS='PROJECT_NAME TOOLS KIND STACK DATA PM PYRUN USE_SAIL_Q TENANT MONEY I18N LAYOUT DEFAULT_BRANCH PROTECTED_BRANCHES TICKET_KEY GIT_EXT SPECKIT_VERSION LANGUAGE FRAMEWORK LAYERING CMD_FORMAT CMD_LINT CMD_TYPECHECK CMD_TEST CMD_BUILD CMD_E2E'
+
+if [ "$REUSE" = y ]; then
+  [ -f .specify/sdd-init.env ] || die "--reuse: .specify/sdd-init.env not found"
+  # Only fill variables that were not given as flags.
+  while IFS= read -r line; do
+    case "$line" in ''|'#'*) continue ;; esac
+    k=${line%%=*}
+    has_word "$SAVED_VARS" "$k" || continue
+    [ -n "${!k-}" ] && continue
+    eval "$line"
+  done < .specify/sdd-init.env
+  ok "Reusing answers from .specify/sdd-init.env"
+fi
+
+# ------------------------------------------------------------------ questions
+
+title "sdd-init $SDD_INIT_VERSION — Spec Kit + agents for $(pwd)"
+[ "$DRY_RUN" = 1 ] && warn "dry run: nothing will be written"
+
+ask PROJECT_NAME "Project name" "$(basename "$(pwd)")"
+choose_multi TOOLS "Which AI coding tools?" "claude" "${TOOL_CHOICES[@]}"
+choose KIND "Backend or frontend?" "backend" "backend|Backend (API / service)" "frontend|Frontend (web app)"
+if [ "$KIND" = backend ]; then
+  choose STACK "Language / framework" "go" "${BACKEND_STACKS[@]}"
+else
+  choose STACK "Language / framework" "react" "${FRONTEND_STACKS[@]}"
+fi
+"stack_${STACK//-/_}"
+
+if [ "$KIND" = backend ] && [ ${#DATA_CHOICES[@]} -gt 0 ]; then
+  choose DATA "Data access" "$DATA_DEFAULT" "${DATA_CHOICES[@]}"
+else
+  DATA=${DATA:-none}
+fi
+data_profile
+[ "$KIND" = frontend ] && DATA_LABEL='typed API client (no direct database access)'
+
+if [ "$NEEDS_PM" = y ]; then
+  pm_def=npm
+  [ -f pnpm-lock.yaml ] && pm_def=pnpm; [ -f yarn.lock ] && pm_def=yarn
+  { [ -f bun.lockb ] || [ -f bun.lock ]; } && pm_def=bun
+  choose PM "Package manager" "$pm_def" "npm|npm" "pnpm|pnpm" "yarn|yarn" "bun|bun"
+fi
+if [ "$NEEDS_PYRUN" = y ]; then
+  py_def=pip; [ -f uv.lock ] && py_def=uv; [ -f poetry.lock ] && py_def=poetry
+  choose PYRUN "Python runner" "$py_def" "uv|uv (uv run …)" "poetry|Poetry (poetry run …)" "pip|plain venv / pip"
+fi
+apply_runner_commands
+
+confirm TENANT "Is it multi-tenant (data of several tenants/customers in one system)?" n
+confirm MONEY "Does it handle money (balances, payments, prices, limits)?" n
+confirm I18N "Does it serve content in several languages?" n
+
+layout_def=single
+if ! git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  for d in */; do [ -d "${d}.git" ] && { layout_def=multi; break; }; done
+fi
+choose LAYOUT "Repository layout" "$layout_def" "single|This folder is one git repo" "multi|This folder holds several git repos (workspace)"
+
+branch_def=main
+if git rev-parse --is-inside-work-tree >/dev/null 2>&1; then
+  b=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)
+  if [ -n "$b" ]; then branch_def=${b#origin/}
+  else b=$(git branch --show-current 2>/dev/null || true); [ -n "$b" ] && branch_def=$b; fi
+fi
+ask DEFAULT_BRANCH "Default branch" "$branch_def"
+prot_def=$DEFAULT_BRANCH
+for b in main master; do has_word "$prot_def" "$b" || prot_def="$prot_def $b"; done
+ask PROTECTED_BRANCHES "Branches agents must never push to (space-separated)" "$prot_def"
+ask TICKET_KEY "Ticket key prefix (Jira/GitLab), e.g. CR, TICKBKND" "PROJ"
+confirm GIT_EXT "Install Spec Kit's git extension (creates NNN-name branches automatically)?" n
+SPECKIT_VERSION=${SPECKIT_VERSION:-$DEFAULT_SPECKIT_VERSION}
+
+# ------------------------------------------------------------------ derived values
+
+set -- $TOOLS
+PRIMARY_TOOL=$1
+TOOLS_LABEL=''; for t in $TOOLS; do TOOLS_LABEL="${TOOLS_LABEL:+$TOOLS_LABEL, }$(tool_label "$t")"; done
+PRIMARY_TOOL_LABEL=$(tool_label "$PRIMARY_TOOL")
+LAYOUT_LABEL='single git repo'; [ "$LAYOUT" = multi ] && LAYOUT_LABEL='workspace of several git repos'
+PROTECTED_BRANCHES_MD=''; for b in $PROTECTED_BRANCHES; do PROTECTED_BRANCHES_MD="${PROTECTED_BRANCHES_MD:+$PROTECTED_BRANCHES_MD, }\`$b\`"; done
+TICKET_KEY_LC=$(printf '%s' "$TICKET_KEY" | tr '[:upper:]' '[:lower:]')
+TICKET_EXAMPLE="specs/001-${TICKET_KEY_LC}-123-short-name/"
+TODAY=$(date +%Y-%m-%d)
+
+register_vars PROJECT_NAME KIND STACK_LABEL LANGUAGE FRAMEWORK LAYERING STACK_RULES SRC_TREE TEST_RULES \
+  MIGRATION_RULES TASK_ORDER REVIEW_FOCUS TECH_ROWS DATA_LABEL DATA_RULES TENANT MONEY I18N \
+  LAYOUT_LABEL DEFAULT_BRANCH PROTECTED_BRANCHES_MD TICKET_KEY TICKET_KEY_LC TICKET_EXAMPLE TODAY \
+  SDD_INIT_VERSION SPECKIT_VERSION TOOLS_LABEL PRIMARY_TOOL_LABEL
+
+# ------------------------------------------------------------------ summary
+
+title "Summary"
+SK_NOTE=''; [ "$SKIP_SPECKIT" = y ] && SK_NOTE=' (skipped)'
+printf '  %-16s %s\n' "Folder" "$(pwd)" "Project" "$PROJECT_NAME" "Tools" "$TOOLS_LABEL (default: $PRIMARY_TOOL_LABEL)" \
+  "Stack" "$KIND · $STACK_LABEL" "Data access" "$DATA_LABEL" "Rules" "tenant=$TENANT money=$MONEY i18n=$I18N" \
+  "Layout" "$LAYOUT_LABEL" "Branches" "default $DEFAULT_BRANCH; protected: $PROTECTED_BRANCHES" \
+  "Ticket key" "$TICKET_KEY" "Spec Kit" "$SPECKIT_VERSION$SK_NOTE"
+printf '  %-16s\n' "Verify:"
+for c in "$CMD_FORMAT" "$CMD_LINT" "$CMD_TYPECHECK" "$CMD_GENERATE" "$CMD_TEST" "$CMD_BUILD" "$CMD_E2E"; do
+  if [ -n "$c" ]; then printf '    %s\n' "$c"; fi
+done
+GO=''
+confirm GO "Generate everything in this folder?" y
+[ "$GO" = y ] || die "Cancelled."
+
+# ------------------------------------------------------------------ spec kit
+
+run_speckit() {
+  local SPECIFY
+  if command -v specify >/dev/null 2>&1; then
+    SPECIFY=(specify)
+  elif command -v uvx >/dev/null 2>&1; then
+    SPECIFY=(uvx --from "git+https://github.com/github/spec-kit.git@${SPECKIT_VERSION}" specify)
+  else
+    die "Spec Kit CLI not found and uv is missing.
+  Install uv:        brew install uv   (or: curl -LsSf https://astral.sh/uv/install.sh | sh)
+  Install Spec Kit:  uv tool install specify-cli --from git+https://github.com/github/spec-kit.git@${SPECKIT_VERSION}
+  Or re-run with --skip-speckit to generate only agents/templates/docs."
+  fi
+  info "Spec Kit: ${SPECIFY[*]}"
+  if [ "$DRY_RUN" = 1 ]; then info "would run: specify init --here --force --integration $PRIMARY_TOOL …"; return 0; fi
+
+  if [ ! -d .specify ]; then
+    "${SPECIFY[@]}" init --here --force --integration "$PRIMARY_TOOL" --script sh --non-interactive --ignore-agent-tools \
+      || die "specify init failed"
+    ok "Spec Kit initialised ($PRIMARY_TOOL)"
+  else
+    info ".specify/ already exists — skipping specify init"
+  fi
+  local t
+  for t in $TOOLS; do
+    [ "$t" = "$PRIMARY_TOOL" ] && continue
+    if [ -f .specify/integration.json ] && grep -q "\"$t\"" .specify/integration.json; then
+      info "integration $t already installed"
+      continue
+    fi
+    # Copilot is not "multi-install safe" in Spec Kit, so any mix with it needs --force.
+    if has_word "$TOOLS" copilot; then
+      "${SPECIFY[@]}" integration install "$t" --force || die "specify integration install $t failed"
+    else
+      "${SPECIFY[@]}" integration install "$t" || die "specify integration install $t failed"
+    fi
+    ok "Spec Kit integration added: $t"
+  done
+  if [ "$GIT_EXT" = y ]; then
+    if [ -d .specify/extensions/git ]; then info "git extension already installed"
+    else "${SPECIFY[@]}" extension add git || warn "could not add the git extension"; fi
+  fi
+}
+
+if [ "$SKIP_SPECKIT" = y ]; then
+  warn "Skipping Spec Kit (--skip-speckit). Run 'specify init --here --integration $PRIMARY_TOOL' later; generated files are kept."
+else
+  run_speckit
+fi
+
+# ------------------------------------------------------------------ generate
+
+title "Generating"
+set_tool_vars "$PRIMARY_TOOL"
+build_template_vars
+build_constitution
+build_agent_vars
+build_delegate_hint
+
+constitution_path=.specify/memory/constitution.md
+# Replace the constitution when it is Spec Kit's placeholder or our own untouched v1.0.0;
+# keep a refined/hand-written one unless --force.
+replace_constitution=y
+if [ -f "$constitution_path" ] && ! grep -q '\[PROJECT_NAME\]' "$constitution_path"; then
+  if ! { grep -q 'generated by sdd-init' "$constitution_path" && grep -q '^\*\*Version\*\*: 1\.0\.0 ' "$constitution_path"; }; then
+    replace_constitution=n
+  fi
+fi
+if [ "$replace_constitution" = y ] || [ "$FORCE" = y ]; then
+  tpl_constitution | render | write_file "$constitution_path"
+else
+  tpl_constitution | render | write_file .specify/memory/constitution.sdd-init.md
+  warn "Kept your existing constitution (it was refined or written by hand). The freshly generated one is in .specify/memory/constitution.sdd-init.md — use --force to replace (the old one is backed up)."
+fi
+
+write_overrides
+
+for t in $TOOLS; do
+  set_tool_vars "$PRIMARY_TOOL"
+  case "$t" in
+    claude)  write_agents_claude ;;
+    codex)   write_agents_codex ;;
+    gemini)  write_agents_gemini ;;
+    copilot) write_agents_copilot ;;
+  esac
+  write_skills_for_tool "$t"
+done
+set_tool_vars "$PRIMARY_TOOL"
+
+write_instruction_files
+write_guide
+
+# Save answers for --reuse.
+if [ "$DRY_RUN" != 1 ]; then
+  {
+    printf '# sdd-init %s answers — used by `sdd-init --reuse`\n' "$SDD_INIT_VERSION"
+    for v in $SAVED_VARS; do
+      val=${!v-}
+      printf "%s='%s'\n" "$v" "${val//\'/\'\\\'\'}"
+    done
+  } | write_file .specify/sdd-init.env
+fi
+
+# ------------------------------------------------------------------ report
+
+title "Done"
+n=$(wc -l <"$WRITE_LOG" | tr -d ' ')
+ok "$n files written or updated"
+if [ -s "$BACKUP_LOG" ]; then info "$(wc -l <"$BACKUP_LOG" | tr -d ' ') previous versions backed up in $BACKUP_DIR/"; fi
+for t in $TOOLS; do
+  case "$t" in
+    claude) command -v claude >/dev/null 2>&1 || warn "claude CLI not found in PATH (install Claude Code to use it)" ;;
+    codex)  command -v codex  >/dev/null 2>&1 || warn "codex CLI not found in PATH" ;;
+    gemini) command -v gemini >/dev/null 2>&1 || warn "gemini CLI not found in PATH" ;;
+  esac
+done
+cat <<EOF
+
+${C_BOLD}Next steps${C_RESET}
+  1. Open the project in $PRIMARY_TOOL_LABEL (restart it if it was running).
+  2. Refine the generated constitution against the real code:
+       $CMD_CONSTITUTION Refine this generated constitution against the actual repository…
+  3. Start a feature:
+       $CMD_SPECIFY ${TICKET_KEY}-123: <what users need>. Short name: ${TICKET_KEY_LC}-123-short-name
+  4. Read SPEC-KIT-GUIDE.md for the full flow.
+EOF
